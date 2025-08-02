@@ -10,13 +10,6 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src import config
 from src.interpretation.grad_cam import get_grad_cam
 
-def find_last_conv_layer(model):
-    """动态寻找模型中最后一个卷积层的名称"""
-    for layer in reversed(model.layers):
-        if isinstance(layer, tf.keras.layers.Conv2D):
-            return layer.name
-    raise ValueError("Model does not contain any Conv2D layers.")
-
 def run_explanation(sample_index: int):
     """
     加载模型和数据，为一个样本生成并可视化Grad-CAM图。
@@ -34,15 +27,10 @@ def run_explanation(sample_index: int):
     # 2. 加载模型
     print(f"Loading best model from {config.BEST_MODEL_PATH}...")
     model = tf.keras.models.load_model(config.BEST_MODEL_PATH)
-
-    # --- 修正之处：动态寻找最后一个卷积层 ---
-    try:
-        last_conv_layer_name = find_last_conv_layer(model)
-        print(f"Dynamically found target layer for Grad-CAM: '{last_conv_layer_name}'")
-    except ValueError as e:
-        print(f"Error: {e}")
-        return
-    # --- 修正结束 ---
+    # 确保最后一个卷积层的名称正确
+    # 您可以在模型summary中找到它，这里我们用config中的值
+    last_conv_layer_name = config.TARGET_CONV_LAYER_NAME 
+    print(f"Using target layer for Grad-CAM: '{last_conv_layer_name}'")
 
     # 3. 加载单个数据样本
     print(f"Loading sample at index: {sample_index}")
@@ -67,6 +55,7 @@ def run_explanation(sample_index: int):
     # 6. 生成并叠加Grad-CAM热力图
     # 窜槽证据图
     heatmap_channeling = get_grad_cam(model, img_array, last_conv_layer_name, dual_view=False)
+    # 良好胶结证据图
     heatmap_good_bond = get_grad_cam(model, img_array, last_conv_layer_name, dual_view=True)
     
     # 7. 可视化
