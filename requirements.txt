@@ -1,0 +1,10 @@
+numpy
+pandas
+scipy
+xarray
+tensorflow==2.9.1 # 或与您的CUDA版本匹配的tensorflow版本
+matplotlib
+pywavelets
+wellpathpy
+h5py
+tqdm
