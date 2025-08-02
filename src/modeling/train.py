@@ -1,87 +1,121 @@
+# src/modeling/train.py
+
 import os
 import sys
+import json
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
-import h5py
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 添加根目录到sys.path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from src import config
-from src.modeling.model import build_cnn_model
-from src.modeling.dataset import create_dataset
+from config import load_config
+from src.modeling.dataset import DataGenerator
+from src.modeling.model import build_cnn_regressor
 
-def run_training():
-    """
-    执行完整的模型训练、验证和保存流程。
-    """
-    if not os.path.exists(config.SCALOGRAM_DATA_PATH):
-        print(f"Error: Scalogram data file not found at {config.SCALOGRAM_DATA_PATH}")
-        print("Please run the 'transform' stage first.")
-        return
+def train_model():
+    """主训练函数。"""
+    # 1. 加载配置、数据索引和标准化统计数据
+    config = load_config()
+    paths = config['paths']
+    model_params = config['modeling']
+    
+    with open(paths['norm_stats'], 'r') as f:
+        norm_stats = json.load(f)
         
-    print("\n--- Starting Model Training ---")
+    indices_data = np.load(paths['split_indices'])
+    train_indices = indices_data['train_indices']
+    val_indices = indices_data['val_indices']
+    
+    with h5py.File(paths['aligned_data'], 'r') as hf:
+        all_csi = hf['csi_labels'][:]
 
-    # 1. 准备数据集索引
-    with h5py.File(config.SCALOGRAM_DATA_PATH, 'r') as hf:
-        num_samples = len(hf['csi_labels'])
-        input_shape = hf['scalograms'].shape[1:]
-    
-    indices = np.arange(num_samples)
-    np.random.shuffle(indices) # 随机打乱索引
-    
-    split_point = int(num_samples * (1 - config.VALIDATION_SPLIT))
-    train_indices = indices[:split_point]
-    val_indices = indices[split_point:]
-    
-    print(f"Total samples: {num_samples}")
-    print(f"Training samples: {len(train_indices)}, Validation samples: {len(val_indices)}")
-    
-    # 2. 创建训练和验证数据集
-    train_dataset = create_dataset(config.SCALOGRAM_DATA_PATH, train_indices, config, is_training=True)
-    val_dataset = create_dataset(config.SCALOGRAM_DATA_PATH, val_indices, config, is_training=False)
-
-    # 3. 构建并编译模型
-    print("Building and compiling model...")
-    model = build_cnn_model(input_shape, config)
-    
-    # 使用Adam优化器和均方误差损失函数
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=config.LEARNING_RATE),
-        loss='mean_squared_error',
-        metrics=['mean_absolute_error'] # MAE更直观
+    # 2. 创建数据集生成器
+    train_generator = DataGenerator(
+        h5_path=paths['scalogram_h5'],
+        indices=train_indices,
+        csi_labels=all_csi,
+        batch_size=model_params['batch_size'],
+        norm_stats=norm_stats
     )
+    
+    val_generator = DataGenerator(
+        h5_path=paths['scalogram_h5'],
+        indices=val_indices,
+        csi_labels=all_csi,
+        batch_size=model_params['batch_size'],
+        norm_stats=norm_stats,
+        shuffle=False # 验证集不需要打乱
+    )
+
+    # 3. 创建 tf.data.Dataset 以获得最佳性能
+    input_shape = model_params['input_shape']
+    train_dataset = tf.data.Dataset.from_generator(
+        train_generator,
+        output_signature=(
+            tf.TensorSpec(shape=(None, *input_shape), dtype=tf.float32),
+            tf.TensorSpec(shape=(None,), dtype=tf.float32)
+        )
+    ).prefetch(tf.data.AUTOTUNE)
+
+    val_dataset = tf.data.Dataset.from_generator(
+        val_generator,
+        output_signature=(
+            tf.TensorSpec(shape=(None, *input_shape), dtype=tf.float32),
+            tf.TensorSpec(shape=(None,), dtype=tf.float32)
+        )
+    ).prefetch(tf.data.AUTOTUNE)
+
+    # 4. 构建并编译模型
+    model = build_cnn_regressor(input_shape)
+    
+    # 使用Huber损失函数，它对异常值不那么敏感，更适合回归任务
+    loss_fn = tf.keras.losses.Huber()
+    
+    model.compile(
+        optimizer=Adam(learning_rate=model_params['learning_rate']),
+        loss=loss_fn,
+        metrics=['mean_absolute_error'] # MAE比MSE更直观
+    )
+    
     model.summary()
 
-    # 4. 设置回调函数
-    # ModelCheckpoint: 只保存在验证集上性能最好的模型
-    checkpoint_cb = ModelCheckpoint(
-        filepath=config.BEST_MODEL_PATH,
-        save_best_only=True,
-        monitor='val_loss',
-        mode='min',
-        verbose=1
-    )
-    # EarlyStopping: 如果验证集损失在一定轮次内没有改善，则提前停止训练
-    early_stopping_cb = EarlyStopping(
-        monitor='val_loss',
-        patience=config.EARLY_STOPPING_PATIENCE,
-        mode='min',
-        restore_best_weights=True, # 训练结束后，模型权重将恢复为最佳那一次
-        verbose=1
-    )
+    # 5. 设置回调函数
+    callbacks = [
+        ModelCheckpoint(
+            filepath=paths['model_checkpoint'],
+            save_best_only=True,
+            monitor='val_loss',
+            mode='min',
+            verbose=1
+        ),
+        EarlyStopping(
+            monitor='val_loss',
+            patience=15, # 如果验证集损失在15个epoch内没有改善，则停止
+            mode='min',
+            verbose=1,
+            restore_best_weights=True
+        ),
+        ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.2, # 学习率衰减因子
+            patience=5,  # 5个epoch不下降就降低学习率
+            min_lr=1e-6,
+            mode='min',
+            verbose=1
+        )
+    ]
 
-    # 5. 开始训练
-    print("\nStarting training...")
+    # 6. 开始训练
+    print("--- Starting Model Training ---")
     history = model.fit(
         train_dataset,
-        epochs=config.EPOCHS,
+        epochs=model_params['epochs'],
         validation_data=val_dataset,
-        callbacks=[checkpoint_cb, early_stopping_cb]
+        callbacks=callbacks
     )
+    print("--- Model Training Finished ---")
 
-    print("\n--- Training Finished ---")
-    print(f"Best model saved to: {config.BEST_MODEL_PATH}")
-
-if __name__ == '__main__':
-    run_training()
+    return history

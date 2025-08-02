@@ -1,47 +1,50 @@
 import tensorflow as tf
 from tensorflow.keras import layers, models
 
-def build_cnn_model(input_shape, config):
+def build_cnn_regressor(input_shape):
     """
-    构建用于预测CSI的定制化CNN回归模型。
-    (策略文档 5.1.2)
-    
+    构建一个增强的CNN回归模型。
+
     Args:
-        input_shape (tuple): 输入尺度图的形状 (height, width)。
-        config (module): 从config.py导入的配置模块。
+        input_shape (tuple): 输入尺度图的形状 (height, width, channels).
 
     Returns:
-        tf.keras.Model: 编译前的Keras模型。
+        A Keras Model instance.
     """
-    # 输入层需要通道信息，所以是 (height, width, 1)
-    full_input_shape = (*input_shape, 1)
-    
-    model_input = layers.Input(shape=full_input_shape)
-    
-    # 在模型最开始增加一个归一化层，将输入值缩放到0-1范围
-    x = layers.Rescaling(1./255.)(model_input) # 假设尺度图最大值在255附近，这是一个常用标准
+    model_input = layers.Input(shape=input_shape)
 
-    # --- 卷积特征提取基座 ---
-    # 块 1
-    x = layers.Conv2D(config.CONV_FILTERS[0], config.KERNEL_SIZE, activation='relu', padding='same')(model_input)
+    # --- 核心修改：移除了 layers.Rescaling(1./255.) ---
+    # x = layers.Rescaling(1./255.)(model_input)  <- 删除这一行
+
+    # 我们直接从原始输入开始
+    x = model_input
+
+    # 第1个卷积块
+    x = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(x)
     x = layers.BatchNormalization()(x)
     x = layers.MaxPooling2D((2, 2))(x)
-    
-    # 块 2
-    x = layers.Conv2D(config.CONV_FILTERS[1], config.KERNEL_SIZE, activation='relu', padding='same')(x)
+
+    # 第2个卷积块
+    x = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(x)
     x = layers.BatchNormalization()(x)
     x = layers.MaxPooling2D((2, 2))(x)
-    
-    # --- 回归头 ---
-    x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dense(config.DENSE_UNITS, activation='relu')(x)
-    x = layers.Dropout(config.DROPOUT_RATE)(x)
+
+    # 【推荐】增加第3个卷积块以增强学习能力
+    x = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling2D((2, 2))(x)
+
+    # 回归头
+    x = layers.Flatten()(x) # 使用Flatten代替GlobalAveragePooling2D以保留更多信息
+    x = layers.Dense(128, activation='relu')(x)
+    x = layers.Dropout(0.5)(x)
+    x = layers.Dense(64, activation='relu')(x)
     
     # 输出层
-    # 只有一个神经元，用于输出连续的CSI值
-    # 激活函数根据配置选择 'sigmoid' 或 'linear'
-    output = layers.Dense(1, activation=config.OUTPUT_ACTIVATION, name='csi_output')(x)
-    
+    # 使用 'sigmoid' 激活函数，因为它天然将输出限制在 (0, 1) 区间，
+    # 这与我们的CSI定义完美匹配，可以帮助模型更快收敛。
+    output = layers.Dense(1, activation='sigmoid')(x)
+
     model = models.Model(inputs=model_input, outputs=output)
     
     return model

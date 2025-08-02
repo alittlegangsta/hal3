@@ -1,25 +1,39 @@
+# src/data_processing/main_preprocess.py
+
 import os
 import sys
 import numpy as np
 import pandas as pd
 import scipy.io
 from scipy.signal import butter, filtfilt
-from scipy.interpolate import interp1d # 导入新的插值库
+from scipy.interpolate import interp1d
 from tqdm import tqdm
+import h5py
+from sklearn.model_selection import train_test_split
+import json
 
-# 将src目录添加到Python路径
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 添加根目录到sys.path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from config import (ULTRASONIC_PATH, SONIC_PATH, ORIENTATION_PATH, ALIGNED_DATA_PATH,
-                    DEPTH_RANGE, SAMPLING_RATE_HZ, FILTER_CUTOFF_HZ, FILTER_ORDER,
-                    DEPTH_RESOLUTION_FT, ZC_THRESHOLD, VERTICAL_WINDOW_SIZE,
-                    BALANCE_CSI_THRESHOLD, MAX_LOW_CSI_SAMPLES, PLOT_DIR)
-from utils.file_io import save_data_to_h5
-from utils.plotting import plot_csi_distribution
+# 从config导入所有需要的变量
+from config import (
+    ULTRASONIC_PATH, SONIC_PATH, ORIENTATION_PATH, ALIGNED_DATA_PATH,
+    DEPTH_RANGE, SAMPLING_RATE_HZ, FILTER_CUTOFF_HZ, FILTER_ORDER,
+    DEPTH_RESOLUTION_FT, ZC_THRESHOLD, VERTICAL_WINDOW_SIZE,
+    PLOT_DIR, SCALOGRAM_H5_PATH, NORM_STATS_PATH, SPLIT_INDICES_PATH,
+    MODELING_CONFIG, DATA_PROCESSING_CONFIG
+)
+# 假设您有这些工具函数
+# from utils.file_io import save_data_to_h5
+# from utils.plotting import plot_csi_distribution
+
+# ==============================================================================
+# 阶段一：函数 (从原始数据到对齐的波形)
+# ==============================================================================
 
 def _load_and_validate_raw_data():
     """加载并验证所有原始.mat文件。"""
-    print("Step 1: Loading and validating raw data...")
+    print("Step 1/4: Loading and validating raw data...")
     cast_mat = scipy.io.loadmat(ULTRASONIC_PATH, squeeze_me=True)
     cast_struct_obj = cast_mat['CAST']
     cast_fields = cast_struct_obj.dtype.names
@@ -50,7 +64,7 @@ def _load_and_validate_raw_data():
 
 def _apply_high_pass_filter(sonic_data):
     """对所有声波波形应用高通滤波器。"""
-    print("Step 2: Applying high-pass filter to sonic waveforms...")
+    print("Step 2/4: Applying high-pass filter to sonic waveforms...")
     b, a = butter(FILTER_ORDER, FILTER_CUTOFF_HZ, btype='high', fs=SAMPLING_RATE_HZ)
     wave_keys = [key for key in sonic_data.keys() if key.startswith('WaveRng')]
     for key in tqdm(wave_keys, desc="Filtering waveforms"):
@@ -59,55 +73,39 @@ def _apply_high_pass_filter(sonic_data):
 
 def _align_data_to_uniform_depth(ultrasonic, sonic, orientation):
     """将所有数据插值到统一的深度轴。"""
-    print("Step 3: Aligning all data to a uniform depth axis...")
+    print("Step 3/4: Aligning all data to a uniform depth axis...")
     uniform_depth = np.arange(DEPTH_RANGE[0], DEPTH_RANGE[1], DEPTH_RESOLUTION_FT)
     
-    # 检查原始深度轴是否单调递增，这是插值的要求
-    zc_original_depth = ultrasonic['Depth']
-    if not np.all(np.diff(zc_original_depth) >= 0):
-        print("  - Sorting ultrasonic data by depth as it is not monotonic.")
-        sort_indices = np.argsort(zc_original_depth)
-        zc_original_depth = zc_original_depth[sort_indices]
-        ultrasonic['Zc'] = ultrasonic['Zc'][:, sort_indices]
+    # 保证深度单调性
+    for name, data_dict, depth_key in [('ultrasonic', ultrasonic, 'Depth'), ('sonic', sonic, 'Depth')]:
+        original_depth = data_dict[depth_key]
+        if not np.all(np.diff(original_depth) >= 0):
+            print(f"  - Sorting {name} data by depth as it is not monotonic.")
+            sort_indices = np.argsort(original_depth)
+            data_dict[depth_key] = original_depth[sort_indices]
+            for key, value in data_dict.items():
+                if key != depth_key and isinstance(value, np.ndarray) and value.ndim == 2:
+                     data_dict[key] = value[:, sort_indices]
 
-    sonic_original_depth = sonic['Depth']
-    if not np.all(np.diff(sonic_original_depth) >= 0):
-        print("  - Sorting sonic data by depth as it is not monotonic.")
-        sort_indices = np.argsort(sonic_original_depth)
-        sonic_original_depth = sonic_original_depth[sort_indices]
-        for key in [k for k in sonic.keys() if k.startswith('WaveRng')]:
-            sonic[key] = sonic[key][:, sort_indices]
-
-    # 插值方位数据
     aligned_orientation = pd.DataFrame({
         'Inc': np.interp(uniform_depth, orientation['Depth_inc'], orientation['Inc']),
         'RelBearing': np.interp(uniform_depth, orientation['Depth_inc'], orientation['RelBearing'])
     })
     
-    # 使用 Scipy.interp1d 进行 Zc 数据插值
-    zc_original_data = ultrasonic['Zc']
-    aligned_zc = np.zeros((zc_original_data.shape[0], len(uniform_depth)))
-    for i in tqdm(range(zc_original_data.shape[0]), desc="Interpolating Zc data (SciPy)"):
-        f_zc = interp1d(zc_original_depth, zc_original_data[i, :], kind='linear', bounds_error=False, fill_value='extrapolate')
-        aligned_zc[i, :] = f_zc(uniform_depth)
+    f_zc = interp1d(ultrasonic['Depth'], ultrasonic['Zc'], kind='linear', bounds_error=False, fill_value='extrapolate', axis=1)
+    aligned_zc = f_zc(uniform_depth)
 
-    # 使用 Scipy.interp1d 进行声波数据插值
     aligned_sonic = {}
     wave_keys = [key for key in sonic.keys() if key.startswith('WaveRng')]
-    for key in tqdm(wave_keys, desc="Interpolating sonic data (SciPy)"):
-        wave_data = sonic[key]
-        interp_wave = np.zeros((wave_data.shape[0], len(uniform_depth)))
-        for j in range(wave_data.shape[0]):
-            f_wave = interp1d(sonic_original_depth, wave_data[j, :], kind='linear', bounds_error=False, fill_value='extrapolate')
-            interp_wave[j, :] = f_wave(uniform_depth)
-        aligned_sonic[key] = interp_wave
+    for key in tqdm(wave_keys, desc="Interpolating sonic data"):
+        f_wave = interp1d(sonic['Depth'], sonic[key], kind='linear', bounds_error=False, fill_value='extrapolate', axis=1)
+        aligned_sonic[key] = f_wave(uniform_depth)
         
     return uniform_depth, aligned_zc, aligned_sonic, aligned_orientation
 
 def _calculate_csi_and_create_dataset(uniform_depth, zc, sonic, orientation):
     """执行方位校正，匹配扇区，并计算CSI。"""
-    print("Step 4: Performing azimuthal correction and calculating CSI...")
-    # ... (此函数的其余部分代码保持完全不变) ...
+    print("Step 4/4: Performing azimuthal correction and calculating CSI...")
     num_depths = len(uniform_depth)
     num_receivers = 8
     receiver_angles = np.arange(num_receivers) * 45
@@ -142,7 +140,7 @@ def _calculate_csi_and_create_dataset(uniform_depth, zc, sonic, orientation):
             
             if azimuth_min < azimuth_max:
                 azimuth_indices = np.where((zc_azimuth_axis >= azimuth_min) & (zc_azimuth_axis <= azimuth_max))[0]
-            else:
+            else: 
                 azimuth_indices = np.where((zc_azimuth_axis >= azimuth_min) | (zc_azimuth_axis <= azimuth_max))[0]
 
             if len(depth_indices) == 0 or len(azimuth_indices) == 0:
@@ -155,52 +153,100 @@ def _calculate_csi_and_create_dataset(uniform_depth, zc, sonic, orientation):
             csi_labels.append(csi)
             metadata.append([depth_val, rec_idx])
 
-    return np.array(waveforms), np.array(csi_labels), np.array(metadata)
+    return np.array(waveforms, dtype=np.float32), np.array(csi_labels, dtype=np.float32), np.array(metadata)
 
 
-def _balance_dataset(waveforms, csi_labels, metadata):
-    """根据CSI值平衡数据集。"""
-    if MAX_LOW_CSI_SAMPLES is None:
-        return waveforms, csi_labels, metadata
-    print(f"Step 5: Balancing dataset...")
-    full_dataset = pd.DataFrame(metadata, columns=['depth', 'receiver_idx'])
-    full_dataset['csi'] = csi_labels
-    low_csi_df = full_dataset[full_dataset['csi'] < BALANCE_CSI_THRESHOLD]
-    high_csi_df = full_dataset[full_dataset['csi'] >= BALANCE_CSI_THRESHOLD]
-    print(f"  - Original counts: Low CSI (<{BALANCE_CSI_THRESHOLD}): {len(low_csi_df)}, High CSI: {len(high_csi_df)}")
-    if len(low_csi_df) > MAX_LOW_CSI_SAMPLES:
-        low_csi_df = low_csi_df.sample(n=MAX_LOW_CSI_SAMPLES, random_state=42)
-        print(f"  - Downsampling Low CSI samples to {MAX_LOW_CSI_SAMPLES}")
-    balanced_df = pd.concat([low_csi_df, high_csi_df]).sort_index()
-    balanced_indices = balanced_df.index.values
-    final_waveforms = waveforms[balanced_indices]
-    final_csi = csi_labels[balanced_indices]
-    final_metadata = metadata[balanced_indices]
-    print(f"  - Final counts: Low CSI: {len(low_csi_df)}, High CSI: {len(high_csi_df)}, Total: {len(final_csi)}")
-    return final_waveforms, final_csi, final_metadata
-
-def run_preprocessing():
-    """执行完整的预处理流程。"""
+def run_stage1_preprocessing():
+    """执行完整的预处理流程 (阶段一)。"""
     if os.path.exists(ALIGNED_DATA_PATH):
-        print(f"Processed data file already exists at {ALIGNED_DATA_PATH}. Skipping.")
+        print(f"Stage 1 Result: Processed data file already exists at {ALIGNED_DATA_PATH}. Skipping.")
         return
+        
     ultrasonic, sonic, orientation = _load_and_validate_raw_data()
     sonic_filtered = _apply_high_pass_filter(sonic)
     uniform_depth, aligned_zc, aligned_sonic, aligned_orientation = \
         _align_data_to_uniform_depth(ultrasonic, sonic_filtered, orientation)
+    
     waveforms, csi_labels, metadata = _calculate_csi_and_create_dataset(
         uniform_depth, aligned_zc, aligned_sonic, aligned_orientation
     )
-    waveforms, csi_labels, metadata = _balance_dataset(waveforms, csi_labels, metadata)
-    print("Step 6: Saving processed and aligned data...")
-    data_to_save = {
-        'waveforms': waveforms,
-        'csi_labels': csi_labels,
-        'metadata': metadata
-    }
-    save_data_to_h5(data_to_save, ALIGNED_DATA_PATH)
+    
+    print("Saving processed and aligned data...")
+    with h5py.File(ALIGNED_DATA_PATH, 'w') as hf:
+        hf.create_dataset('waveforms', data=waveforms)
+        hf.create_dataset('csi_labels', data=csi_labels)
+        hf.create_dataset('metadata', data=metadata)
+        
     print(f"Successfully saved aligned data to {ALIGNED_DATA_PATH}")
-    plot_csi_distribution(csi_labels, save_path=os.path.join(PLOT_DIR, 'csi_distribution.png'))
 
-if __name__ == '__main__':
-    run_preprocessing()
+# ==============================================================================
+# 阶段三：函数 (数据集划分与归一化)
+# ==============================================================================
+
+def run_stage2_split_and_normalize():
+    """
+    (阶段三) 加载CWT后的尺度图数据，执行分层抽样来划分训练/验证集，
+    并仅使用训练集数据计算和保存归一化统计数据。
+    """
+    print("Loading CSI labels for splitting...")
+    try:
+        with h5py.File(ALIGNED_DATA_PATH, 'r') as hf:
+            all_csi = hf['csi_labels'][:]
+    except (FileNotFoundError, KeyError):
+        print(f"Error: Could not load 'csi_labels' from {ALIGNED_DATA_PATH}.")
+        print("Please ensure you have successfully run Stage 1 ('preprocess') first.")
+        return
+
+    num_samples = len(all_csi)
+    indices = np.arange(num_samples)
+
+    csi_bins_def = DATA_PROCESSING_CONFIG['csi_bins']
+    csi_labels_binned = np.digitize(all_csi, bins=[c[2] for c in csi_bins_def]) # Use upper bound for digitize
+    
+    print("Performing stratified split based on CSI bins...")
+    train_indices, val_indices = train_test_split(
+        indices,
+        test_size=MODELING_CONFIG['validation_split'],
+        stratify=csi_labels_binned,
+        random_state=MODELING_CONFIG['random_seed']
+    )
+
+    print(f"Train samples: {len(train_indices)}, Validation samples: {len(val_indices)}")
+
+    print("Calculating normalization stats (mean, std) from training set scalograms...")
+    try:
+        with h5py.File(SCALOGRAM_H5_PATH, 'r') as hf:
+            train_scalograms_dset = hf['scalograms']
+            
+            batch_size = 512
+            sum_val = 0.0
+            sum_sq_val = 0.0
+            total_pixels = 0
+            num_train_samples = len(train_indices)
+            
+            for i in tqdm(range(0, num_train_samples, batch_size), desc="Calculating Mean"):
+                batch_indices = np.sort(train_indices[i:i+batch_size])
+                batch_data = train_scalograms_dset[batch_indices, :, :]
+                sum_val += np.sum(batch_data, dtype=np.float64)
+                total_pixels += batch_data.size
+            mean_val = sum_val / total_pixels
+
+            for i in tqdm(range(0, num_train_samples, batch_size), desc="Calculating Std Dev"):
+                batch_indices = np.sort(train_indices[i:i+batch_size])
+                batch_data = train_scalograms_dset[batch_indices, :, :]
+                sum_sq_val += np.sum(((batch_data - mean_val) ** 2), dtype=np.float64)
+            std_val = np.sqrt(sum_sq_val / total_pixels)
+
+    except (FileNotFoundError, KeyError):
+        print(f"Error: Could not load 'scalograms' from {SCALOGRAM_H5_PATH}.")
+        print("Please ensure you have run the CWT transformation script to generate this file.")
+        return
+
+    print(f"Calculation complete: Mean = {mean_val:.4f}, Std = {std_val:.4f}")
+
+    with open(NORM_STATS_PATH, 'w') as f:
+        json.dump({'mean': mean_val, 'std': std_val}, f)
+    print(f"Normalization stats saved to: {NORM_STATS_PATH}")
+
+    np.savez(SPLIT_INDICES_PATH, train_indices=train_indices, val_indices=val_indices)
+    print(f"Dataset split indices saved to: {SPLIT_INDICES_PATH}")

@@ -1,52 +1,50 @@
-import h5py
+# src/modeling/dataset.py
+
 import numpy as np
-import tensorflow as tf
+import h5py
 
-def data_generator(h5_path, indices):
+class DataGenerator:
     """
-    一个Python生成器，用于从HDF5文件中逐个产生数据样本。
-    
-    Args:
-        h5_path (str): HDF5文件路径。
-        indices (list or np.ndarray): 要产生的数据样本的索引列表。
+    为Keras模型生成数据的生成器。
+    在生成每个批次时动态地进行标准化。
     """
-    with h5py.File(h5_path, 'r') as hf:
-        scalograms = hf['scalograms']
-        csi_labels = hf['csi_labels']
-        for i in indices:
-            # 产生 (特征, 标签) 对
-            yield scalograms[i, :, :], csi_labels[i]
-
-def create_dataset(h5_path, indices, config, is_training=True):
-    """
-    基于生成器创建一个 tf.data.Dataset 对象。
-    
-    Args:
-        h5_path (str): HDF5文件路径。
-        indices (list or np.ndarray): 数据集的索引。
-        config (module): 配置模块。
-        is_training (bool): 是否为训练集（决定是否打乱数据）。
-
-    Returns:
-        tf.data.Dataset: 配置好的数据集对象。
-    """
-    # 从HDF5文件中获取数据维度信息
-    with h5py.File(h5_path, 'r') as hf:
-        output_shape = hf['scalograms'].shape[1:]
+    def __init__(self, h5_path, indices, csi_labels, batch_size, norm_stats, shuffle=True):
+        self.h5_path = h5_path
+        self.indices = indices
+        self.csi_labels = csi_labels
+        self.batch_size = batch_size
+        self.norm_stats = norm_stats
+        self.shuffle = shuffle
+        self.num_samples = len(self.indices)
+        self.mean = self.norm_stats['mean']
+        self.std = self.norm_stats['std']
         
-    dataset = tf.data.Dataset.from_generator(
-        lambda: data_generator(h5_path, indices),
-        output_signature=(
-            tf.TensorSpec(shape=output_shape, dtype=tf.float32),
-            tf.TensorSpec(shape=(), dtype=tf.float32)
-        )
-    )
-    
-    if is_training:
-        # 对训练数据进行充分打乱
-        dataset = dataset.shuffle(buffer_size=len(indices), reshuffle_each_iteration=True)
+    def __len__(self):
+        """返回每个epoch的批次数。"""
+        return int(np.ceil(self.num_samples / self.batch_size))
+
+    def __call__(self):
+        """TensorFlow Dataset.from_generator 需要一个可调用对象。"""
+        # 在每个epoch开始时，如果需要，打乱索引
+        epoch_indices = np.copy(self.indices)
+        if self.shuffle:
+            np.random.shuffle(epoch_indices)
         
-    dataset = dataset.batch(config.BATCH_SIZE)
-    dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
-    
-    return dataset
+        with h5py.File(self.h5_path, 'r') as hf:
+            scalograms_dset = hf['scalograms']
+            
+            for i in range(0, self.num_samples, self.batch_size):
+                batch_indices = epoch_indices[i:i + self.batch_size]
+                
+                # h5py需要排序后的索引以获得最佳性能
+                sorted_batch_indices = np.sort(batch_indices)
+                
+                # 读取一批数据
+                batch_scalograms = scalograms_dset[sorted_batch_indices, :, :]
+                batch_csi = self.csi_labels[sorted_batch_indices]
+                
+                # --- 核心：执行标准化 ---
+                normalized_scalograms = (batch_scalograms - self.mean) / self.std
+                
+                # 为模型输入增加一个通道维度 (..., 1)
+                yield np.expand_dims(normalized_scalograms, axis=-1), batch_csi
