@@ -1,48 +1,73 @@
+# src/modeling/model.py (最终性能版: SE-ResNet)
+
 import tensorflow as tf
 from tensorflow.keras import layers, models
 
+def se_block(input_tensor, ratio=8):
+    """
+    Squeeze-and-Excitation (SE) 注意力模块。
+    """
+    channels = input_tensor.shape[-1]
+    se = layers.GlobalAveragePooling2D()(input_tensor)
+    se = layers.Reshape((1, 1, channels))(se)
+    se = layers.Dense(channels // ratio, activation='relu', kernel_initializer='he_normal', use_bias=False)(se)
+    se = layers.Dense(channels, activation='sigmoid', kernel_initializer='he_normal', use_bias=False)(se)
+    return layers.multiply([input_tensor, se])
+
+def resnet_block(input_tensor, filters, kernel_size=(3, 3)):
+    """
+    带有SE注意力机制的残差模块 (SE-ResNet Block)。
+    """
+    # 主路径
+    x = layers.Conv2D(filters, kernel_size, padding='same')(input_tensor)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    
+    x = layers.Conv2D(filters, kernel_size, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+
+    # 引入SE模块
+    x = se_block(x)
+    
+    # 短路连接 (Residual Connection)
+    # 如果输入和输出的通道数不同，则需要一个1x1卷积来匹配维度
+    if input_tensor.shape[-1] != filters:
+        shortcut = layers.Conv2D(filters, (1, 1), padding='same')(input_tensor)
+    else:
+        shortcut = input_tensor
+        
+    x = layers.add([x, shortcut])
+    x = layers.ReLU()(x)
+    return x
+
 def build_cnn_regressor(input_shape):
     """
-    构建一个增强的CNN回归模型。
-
-    Args:
-        input_shape (tuple): 输入尺度图的形状 (height, width, channels).
-
-    Returns:
-        A Keras Model instance.
+    构建一个基于SE-ResNet的、能力更强的最终版CNN回归模型。
     """
     model_input = layers.Input(shape=input_shape)
 
-    # --- 核心修改：移除了 layers.Rescaling(1./255.) ---
-    # x = layers.Rescaling(1./255.)(model_input)  <- 删除这一行
-
-    # 我们直接从原始输入开始
-    x = model_input
-
-    # 第1个卷积块
-    x = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(x)
+    # 初始卷积层，用于初步特征提取和降采样
+    x = layers.Conv2D(64, (7, 7), strides=(2, 2), padding='same')(model_input)
     x = layers.BatchNormalization()(x)
-    x = layers.MaxPooling2D((2, 2))(x)
+    x = layers.ReLU()(x)
+    x = layers.MaxPooling2D((3, 3), strides=(2, 2), padding='same')(x)
 
-    # 第2个卷积块
-    x = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.MaxPooling2D((2, 2))(x)
+    # 堆叠多个SE-ResNet模块
+    x = resnet_block(x, 64)
+    x = resnet_block(x, 64)
 
-    # 【推荐】增加第3个卷积块以增强学习能力
-    x = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.MaxPooling2D((2, 2))(x)
+    x = resnet_block(x, 128) # 增加通道数，学习更复杂的特征
+    x = layers.MaxPooling2D((2, 2))(x) # 进一步降采样
 
+    x = resnet_block(x, 256)
+    x = resnet_block(x, 256)
+    
     # 回归头
-    x = layers.Flatten()(x) # 使用Flatten代替GlobalAveragePooling2D以保留更多信息
+    x = layers.GlobalAveragePooling2D()(x)
     x = layers.Dense(128, activation='relu')(x)
     x = layers.Dropout(0.5)(x)
-    x = layers.Dense(64, activation='relu')(x)
     
     # 输出层
-    # 使用 'sigmoid' 激活函数，因为它天然将输出限制在 (0, 1) 区间，
-    # 这与我们的CSI定义完美匹配，可以帮助模型更快收敛。
     output = layers.Dense(1, activation='sigmoid')(x)
 
     model = models.Model(inputs=model_input, outputs=output)

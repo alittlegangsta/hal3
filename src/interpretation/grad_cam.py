@@ -1,59 +1,76 @@
-import numpy as np
+# src/interpretation/grad_cam.py
+
 import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 
-def get_grad_cam(model, img_array, last_conv_layer_name, dual_view=False):
-    """
-    为回归模型计算Grad-CAM热力图。
-    (修正版：增加了将热力图缩放回原始图像尺寸的步骤)
-    
-    Args:
-        model (tf.keras.Model): 训练好的模型。
-        img_array (np.ndarray): 单个输入图像 (尺度图), shape (1, H, W, 1)。
-        last_conv_layer_name (str): 最后一个卷积层的名称。
-        dual_view (bool): 是否为“良好胶结证据图”模式 (计算负梯度的影响)。
-
-    Returns:
-        np.ndarray: 生成的、与原图尺寸相同的热力图。
-    """
-    # 1. 构建一个新模型
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=None):
+    # Create a model that maps the input image to the activations
+    # of the last conv layer as well as the output predictions
     grad_model = tf.keras.models.Model(
         [model.inputs], [model.get_layer(last_conv_layer_name).output, model.output]
     )
 
-    # 2. 计算梯度
+    # Then, we compute the gradient of the top predicted class for our input image
+    # with respect to the activations of the last conv layer
     with tf.GradientTape() as tape:
         last_conv_layer_output, preds = grad_model(img_array)
-        class_channel = preds[0]
-        if dual_view:
-             class_channel = -class_channel
+        if pred_index is None:
+            # For regression, the output is the single prediction value
+            class_channel = preds[0]
+        else:
+            class_channel = preds[:, pred_index]
 
+    # This is the gradient of the output neuron (top predicted or chosen)
+    # with regard to the output feature map of the last conv layer
     grads = tape.gradient(class_channel, last_conv_layer_output)
 
-    # 3. 计算通道重要性权重
+    # This is a vector where each entry is the mean intensity of the gradient
+    # over a specific feature map channel
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
 
-    # 4. 计算热力图
+    # We multiply each channel in the feature map array
+    # by "how important this channel is" with regard to the top predicted class
+    # then sum all the channels to obtain the heatmap class activation
     last_conv_layer_output = last_conv_layer_output[0]
     heatmap = last_conv_layer_output @ pooled_grads[..., tf.newaxis]
     heatmap = tf.squeeze(heatmap)
 
-    # 5. 应用ReLU并归一化
-    # 添加一个微小的epsilon防止除以零
-    heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + tf.keras.backend.epsilon())
-    
-    # --- 新增的关键步骤：将热力图缩放到与原始图像相同的尺寸 ---
-    # 获取原始图像的 H 和 W
-    original_height = img_array.shape[1]
-    original_width = img_array.shape[2]
-    
-    # tf.image.resize 需要一个4D张量 (batch, height, width, channels)
-    heatmap_4d = tf.expand_dims(tf.expand_dims(heatmap, axis=0), axis=-1)
-    
-    # 使用双线性插值进行缩放
-    resized_heatmap = tf.image.resize(heatmap_4d, [original_height, original_width])
-    
-    # 移除多余的维度
-    resized_heatmap_squeezed = tf.squeeze(resized_heatmap)
-    # --- 修正结束 ---
+    # For visualization purpose, we will also normalize the heatmap between 0 & 1
+    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
+    return heatmap.numpy()
 
-    return resized_heatmap_squeezed.numpy()
+def save_and_display_gradcam(img, heatmap, path, alpha=0.6, title=""):
+    # Load the original image
+    img = img.squeeze()
+
+    # Rescale heatmap to a range 0-255
+    heatmap = np.uint8(255 * heatmap)
+
+    # Use jet colormap to colorize heatmap
+    jet = cm.get_cmap("jet")
+
+    # Use RGB values of the colormap
+    jet_colors = jet(np.arange(256))[:, :3]
+    jet_heatmap = jet_colors[heatmap]
+
+    # Create an image with RGB colorized heatmap
+    jet_heatmap = tf.keras.preprocessing.image.array_to_img(jet_heatmap)
+    jet_heatmap = jet_heatmap.resize((img.shape[1], img.shape[0]))
+    jet_heatmap = tf.keras.preprocessing.image.img_to_array(jet_heatmap)
+
+    # Superimpose the heatmap on original image
+    superimposed_img = jet_heatmap * alpha + np.stack([img*255]*3, axis=-1) * (1-alpha)
+    superimposed_img = tf.keras.preprocessing.image.array_to_img(superimposed_img)
+
+    # Save the superimposed image
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.imshow(superimposed_img)
+    ax.set_title(title, fontsize=14)
+    ax.set_xlabel("Time Steps", fontsize=12)
+    ax.set_ylabel("Frequency (Scale Index)", fontsize=12)
+    ax.axis('off')
+    
+    plt.savefig(path, dpi=300, bbox_inches='tight')
+    plt.close(fig)

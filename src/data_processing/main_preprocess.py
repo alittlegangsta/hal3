@@ -21,6 +21,9 @@ from config import (
     DEPTH_RANGE, SAMPLING_RATE_HZ, FILTER_CUTOFF_HZ, FILTER_ORDER,
     DEPTH_RESOLUTION_FT, ZC_THRESHOLD, VERTICAL_WINDOW_SIZE,
     PLOT_DIR, SCALOGRAM_H5_PATH, NORM_STATS_PATH, SPLIT_INDICES_PATH,
+    # --- 关键修正：在这里添加缺失的变量 ---
+    TRAINING_READY_DATA_PATH,
+    # -----------------------------------------
     MODELING_CONFIG, DATA_PROCESSING_CONFIG
 )
 # 假设您有这些工具函数
@@ -201,7 +204,8 @@ def run_stage2_split_and_normalize():
     indices = np.arange(num_samples)
 
     csi_bins_def = DATA_PROCESSING_CONFIG['csi_bins']
-    csi_labels_binned = np.digitize(all_csi, bins=[c[2] for c in csi_bins_def]) # Use upper bound for digitize
+    # 使用元组的上界进行分箱
+    csi_labels_binned = np.digitize(all_csi, bins=[c[2] for c in csi_bins_def[:-1]])
     
     print("Performing stratified split based on CSI bins...")
     train_indices, val_indices = train_test_split(
@@ -250,3 +254,88 @@ def run_stage2_split_and_normalize():
 
     np.savez(SPLIT_INDICES_PATH, train_indices=train_indices, val_indices=val_indices)
     print(f"Dataset split indices saved to: {SPLIT_INDICES_PATH}")
+
+# ==============================================================================
+# 最终安全版：阶段四函数 (创建最终的训练就绪数据)
+# ==============================================================================
+def run_stage3_normalize_data():
+    """
+    (阶段四) 读取尺度图，【分块】应用标准化，并保存为最终的训练就绪HDF5文件。
+    此版本经过内存优化，可避免内存爆炸。
+    """
+    print("Verifying required files exist...")
+    required_files = [SCALOGRAM_H5_PATH, NORM_STATS_PATH, SPLIT_INDICES_PATH]
+    for f_path in required_files:
+        if not os.path.exists(f_path):
+            print(f"Error: Required file not found at {f_path}")
+            print("Please ensure you have run 'cwt' and 'split' steps first.")
+            return
+            
+    if os.path.exists(TRAINING_READY_DATA_PATH):
+        print(f"Final data file already exists at {TRAINING_READY_DATA_PATH}. Skipping.")
+        return
+
+    print("Loading split indices and normalization stats...")
+    indices_data = np.load(SPLIT_INDICES_PATH)
+    train_indices = indices_data['train_indices']
+    val_indices = indices_data['val_indices']
+    
+    with open(NORM_STATS_PATH, 'r') as f:
+        norm_stats = json.load(f)
+    mean = norm_stats['mean']
+    std = norm_stats['std']
+
+    # --- 定义处理参数 ---
+    batch_size = 1024 # 定义一个合理的批处理大小，可以根据您的RAM调整
+
+    print(f"Opening data files and preparing for chunked processing (batch size: {batch_size})...")
+    with h5py.File(SCALOGRAM_H5_PATH, 'r') as hf_in, \
+         h5py.File(ALIGNED_DATA_PATH, 'r') as hf_labels, \
+         h5py.File(TRAINING_READY_DATA_PATH, 'w') as hf_out:
+
+        # --- 创建目标数据集 ---
+        # 预先定义好最终文件的结构和尺寸
+        x_train_shape = (len(train_indices), hf_in['scalograms'].shape[1], hf_in['scalograms'].shape[2])
+        x_val_shape = (len(val_indices), hf_in['scalograms'].shape[1], hf_in['scalograms'].shape[2])
+
+        dset_x_train = hf_out.create_dataset('x_train', shape=x_train_shape, dtype=np.float32, chunks=True)
+        dset_y_train = hf_out.create_dataset('y_train', shape=(len(train_indices),), dtype=np.float32)
+        dset_x_val = hf_out.create_dataset('x_val', shape=x_val_shape, dtype=np.float32, chunks=True)
+        dset_y_val = hf_out.create_dataset('y_val', shape=(len(val_indices),), dtype=np.float32)
+
+        # --- 按块处理训练集 ---
+        print(f"Processing {len(train_indices)} training samples in chunks...")
+        sorted_train_indices = np.sort(train_indices) # 排序以优化HDF5读取
+        for i in tqdm(range(0, len(sorted_train_indices), batch_size), desc="Normalizing Train Set"):
+            batch_indices = sorted_train_indices[i:i + batch_size]
+            
+            # 1. 读取一小批数据
+            x_batch = hf_in['scalograms'][batch_indices, :, :]
+            y_batch = hf_labels['csi_labels'][batch_indices]
+            
+            # 2. 在内存中对这一小批数据进行标准化
+            x_batch_norm = (x_batch - mean) / std
+            
+            # 3. 将处理好的小批数据写入到新文件的对应位置
+            start_index = i
+            end_index = i + len(batch_indices)
+            dset_x_train[start_index:end_index, :, :] = x_batch_norm
+            dset_y_train[start_index:end_index] = y_batch
+
+        # --- 按块处理验证集 ---
+        print(f"Processing {len(val_indices)} validation samples in chunks...")
+        sorted_val_indices = np.sort(val_indices)
+        for i in tqdm(range(0, len(sorted_val_indices), batch_size), desc="Normalizing Validation Set"):
+            batch_indices = sorted_val_indices[i:i + batch_size]
+            
+            x_batch = hf_in['scalograms'][batch_indices, :, :]
+            y_batch = hf_labels['csi_labels'][batch_indices]
+            
+            x_batch_norm = (x_batch - mean) / std
+            
+            start_index = i
+            end_index = i + len(batch_indices)
+            dset_x_val[start_index:end_index, :, :] = x_batch_norm
+            dset_y_val[start_index:end_index] = y_batch
+
+    print("Successfully created the final training-ready data file with memory optimization.")
